@@ -22,10 +22,13 @@ export interface NoteEvent {
   startBeat?: number;
   durationBeats?: number;
   staff?: 'treble' | 'bass';
-  voice?: number;
+  voice?: number; // 1 or 2
   fingering?: number | null;
-  tie?: 'start' | 'stop' | null;
-  slur?: boolean;
+  tie?: 'start' | 'stop' | 'continue' | null;
+  slur?: boolean; // Legacy flag, prefer slurId
+  slurId?: string | null; // Identifier for slur groups
+  beamId?: string | null; // Identifier for beam groups
+  isRest?: boolean; // explicit rest
 }
 
 export interface AudioState {
