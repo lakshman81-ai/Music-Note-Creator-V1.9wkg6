@@ -1,5 +1,5 @@
 
-import { NoteEvent } from '../types';
+import { NoteEvent, Diagnostics, SlurValidationStats } from '../types';
 import { formatPitch } from '../utils/pitchUtils';
 
 // Constants
@@ -39,8 +39,8 @@ export const MusicNotationService = {
   /**
    * Main pipeline function to transform raw audio events into engraved-ready data
    */
-  processNotes(rawNotes: NoteEvent[], bpm: number): Measure[] {
-    if (rawNotes.length === 0) return [];
+  processNotes(rawNotes: NoteEvent[], bpm: number): { measures: Measure[], diagnostics: Diagnostics } {
+    if (rawNotes.length === 0) return { measures: [], diagnostics: this.createEmptyDiagnostics() };
 
     // 0. Define Staves
     const staves: StaffInfo[] = [
@@ -77,9 +77,22 @@ export const MusicNotationService = {
     // 6. Global Validation & Fix Pass (New Logic)
     // We flatten measures to validate across the board or validate per measure if localized
     // Some checks (cross-staff slurs) are already impossible if we only group by staff, but let's check everything.
-    this.validateAndFix(measures);
+    const diagnostics = this.validateAndFix(measures);
 
-    return measures;
+    return { measures, diagnostics };
+  },
+
+  createEmptyDiagnostics(): Diagnostics {
+    return {
+        slurValidation: {
+            totalSlursAttempted: 0,
+            slursKept: 0,
+            slursRemoved: 0,
+            reasonsSummary: {},
+            examples: [],
+            collisionSafetySkipped: false
+        }
+    };
   },
 
   quantizeNotes(rawNotes: NoteEvent[], bpm: number): NoteEvent[] {
@@ -433,70 +446,193 @@ export const MusicNotationService = {
       }
   },
 
-  validateAndFix(measures: Measure[]) {
+  validateAndFix(measures: Measure[]): Diagnostics {
+      // 1. Existing Measure & Ledger Check
       measures.forEach(m => {
           m.notes.forEach(note => {
-              // Rule: No slur spans across staves (implicit by construction but good to check)
-              // Rule: No slur spans across voices (implicit by construction)
-
-              // Validate Ledger Lines <= 3 (Service Level Check)
               if (note.midi_pitch) {
                   const clef = note.staff as 'treble' | 'bass';
                   const ledger = this.ledgerLinesForStaff(note.midi_pitch, clef);
                   if (ledger > LEDGER_LIMIT) {
                       if (!note.remediationFlags) note.remediationFlags = [];
                       note.remediationFlags.push(`excess_ledger_lines_${ledger}`);
-                      // Here we could forcefully re-assign staff, but that might violate the split point rules.
-                      // For now, we flag it.
-                  }
-              }
-
-              // Validate Slurs
-              if (note.slurId) {
-                  // Check if slur group is valid
-                  // Find all notes in this slur group (within the measure)
-                  const group = m.notes.filter(n => n.slurId === note.slurId);
-
-                  // Check constraints
-                  const staves = new Set(group.map(n => n.staff));
-                  const voices = new Set(group.map(n => n.voice));
-
-                  if (staves.size > 1) {
-                      // Cross-staff slur detected -> Remove it
-                      group.forEach(n => {
-                          n.slurId = null;
-                          if (!n.remediationFlags) n.remediationFlags = [];
-                          n.remediationFlags.push('slur_removed_cross_staff');
-                      });
-                  }
-
-                  if (voices.size > 1) {
-                      // Cross-voice slur detected -> Remove it
-                      group.forEach(n => {
-                          n.slurId = null;
-                          if (!n.remediationFlags) n.remediationFlags = [];
-                          n.remediationFlags.push('slur_removed_cross_voice');
-                      });
-                  }
-
-                  // Check for chords in slur
-                  const hasChords = group.some(n => {
-                      const sameTime = group.filter(x => Math.abs(x.startBeat! - n.startBeat!) < 0.001);
-                      return sameTime.length > 1;
-                  });
-                  if (hasChords) {
-                      group.forEach(n => {
-                          n.slurId = null;
-                          if (!n.remediationFlags) n.remediationFlags = [];
-                          n.remediationFlags.push('slur_removed_has_chord');
-                      });
                   }
               }
           });
-
-          // Validate Measure Duration (Sum)
-          // Just a check for now, fixing it would require re-generating rests
       });
+
+      // 2. Comprehensive Slur Validation
+      const slurDiagnostics = this.validateSlurs(measures, {
+          allowCrossMeasureSlurs: false,
+          melodicN: 1,
+          enableCollisionHeuristic: false // Not using heuristic as per user pref to skip if complex
+      });
+
+      return {
+          slurValidation: slurDiagnostics
+      };
+  },
+
+  validateSlurs(measures: Measure[], options: { allowCrossMeasureSlurs: boolean, melodicN: number, enableCollisionHeuristic: boolean }): SlurValidationStats {
+      const allNotes = measures.flatMap(m => m.notes);
+
+      // Group by slurId
+      const slurs = new Map<string, NoteEvent[]>();
+      allNotes.forEach(n => {
+          if (n.slurId) {
+              if (!slurs.has(n.slurId)) slurs.set(n.slurId, []);
+              slurs.get(n.slurId)!.push(n);
+          }
+      });
+
+      const stats: SlurValidationStats = {
+          totalSlursAttempted: slurs.size,
+          slursKept: 0,
+          slursRemoved: 0,
+          reasonsSummary: {},
+          examples: [],
+          collisionSafetySkipped: !options.enableCollisionHeuristic
+      };
+
+      // Helper to record failure
+      const failSlur = (slurId: string, reason: string, notes: NoteEvent[]) => {
+          notes.forEach(n => {
+              n.slurId = null;
+              if (!n.remediationFlags) n.remediationFlags = [];
+              n.remediationFlags.push(`slur_removed_${reason}`);
+          });
+          stats.slursRemoved++;
+          stats.reasonsSummary[reason] = (stats.reasonsSummary[reason] || 0) + 1;
+
+          if (!stats.examples.some(e => e.reason === reason)) {
+              stats.examples.push({ slurId, reason, noteIds: notes.map(n => n.id) });
+          }
+      };
+
+      for (const [slurId, group] of slurs.entries()) {
+          // Sort by startBeat to ensure order
+          group.sort((a,b) => a.startBeat! - b.startBeat!);
+
+          let valid = true;
+
+          // Rule 1: Same-staff
+          const staffs = new Set(group.map(n => n.staff));
+          if (staffs.size > 1) {
+              failSlur(slurId, "cross_staff", group);
+              valid = false; continue;
+          }
+          const staff = group[0].staff!;
+
+          // Rule 6: Voice consistency
+          const voices = new Set(group.map(n => n.voice));
+          if (voices.size > 1) {
+              failSlur(slurId, "cross_voice", group);
+              valid = false; continue;
+          }
+          const voice = group[0].voice!;
+
+          // Rule 2: No-chord
+          const hasChord = group.some(n => {
+             // Find any other notes in allNotes that share same startBeat, staff, but different ID
+             const concurrent = allNotes.filter(o =>
+                 o.staff === n.staff &&
+                 Math.abs(o.startBeat! - n.startBeat!) < 0.001 &&
+                 o.id !== n.id
+             );
+             return concurrent.length > 0;
+          });
+          if (hasChord) {
+              failSlur(slurId, "has_chord", group);
+              valid = false; continue;
+          }
+
+          // Rule 3: No-rest crossing
+          const startBeat = group[0].startBeat!;
+          const endBeat = group[group.length - 1].startBeat! + group[group.length - 1].durationBeats!;
+
+          const crossedRest = allNotes.some(n =>
+              n.isRest &&
+              n.staff === staff &&
+              n.voice === voice &&
+              n.startBeat! > startBeat + 0.001 &&
+              (n.startBeat! + n.durationBeats!) < endBeat - 0.001
+          );
+
+          if (crossedRest) {
+               failSlur(slurId, "rest_crossing", group);
+               valid = false; continue;
+          }
+
+          // Rule 4: Measure containment
+          if (!options.allowCrossMeasureSlurs) {
+             const measureIndices = new Set(group.map(n => Math.floor(n.startBeat! / BEATS_PER_MEASURE)));
+             if (measureIndices.size > 1) {
+                 failSlur(slurId, "cross_measure", group);
+                 valid = false; continue;
+             }
+          }
+
+          // Rule 5: Gap threshold
+          let gapFail = false;
+          for (let i = 0; i < group.length - 1; i++) {
+              const curr = group[i];
+              const next = group[i+1];
+              const gap = next.startBeat! - (curr.startBeat! + curr.durationBeats!);
+              if (gap > (1/32) + 0.0001) {
+                  gapFail = true; break;
+              }
+          }
+          if (gapFail) {
+              failSlur(slurId, "gap_threshold", group);
+              valid = false; continue;
+          }
+
+          // Rule 7: Melodic continuity
+          // "Destination pitch must be among the N nearest single-note pitches in the same voice"
+          // We interpret this as: next slur note must be the immediately next note in the voice line (N=1)
+
+          let continuityFail = false;
+          // Get all notes in this voice/staff sorted
+          const voiceNotes = allNotes
+              .filter(n => n.staff === staff && n.voice === voice && !n.isRest)
+              .sort((a,b) => a.startBeat! - b.startBeat!);
+
+          for (let i = 0; i < group.length - 1; i++) {
+              const curr = group[i];
+              const next = group[i+1];
+
+              const currIdx = voiceNotes.findIndex(n => n.id === curr.id);
+              const nextIdx = voiceNotes.findIndex(n => n.id === next.id);
+
+              if (currIdx === -1 || nextIdx === -1) {
+                  // Should not happen
+                  continue;
+              }
+
+              // The distance between them in the sorted list of single notes
+              const dist = nextIdx - currIdx;
+
+              // If dist > N, it means we jumped over (dist-1) notes
+              if (dist > options.melodicN) {
+                  continuityFail = true; break;
+              }
+          }
+          if (continuityFail) {
+              failSlur(slurId, "melodic_discontinuity", group);
+              valid = false; continue;
+          }
+
+          // Rule 8: Collision safety
+          if (options.enableCollisionHeuristic) {
+              // Heuristic not implemented yet, skipped as per config
+          }
+
+          if (valid) {
+              stats.slursKept++;
+          }
+      }
+
+      return stats;
   },
 
   fillMeasureWithRests(notes: NoteEvent[], measureStart: number, measureEnd: number): NoteEvent[] {
