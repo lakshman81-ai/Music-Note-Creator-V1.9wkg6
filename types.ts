@@ -36,6 +36,21 @@ export interface NoteEvent {
   remediationFlags?: string[];
 }
 
+export interface SlurValidationStats {
+  totalSlursAttempted: number;
+  slursKept: number;
+  slursRemoved: number;
+  reasonsSummary: Record<string, number>;
+  examples: Array<{ slurId: string; reason: string; noteIds: string[] }>;
+  collisionSafetySkipped: boolean;
+}
+
+export interface Diagnostics {
+  slurValidation: SlurValidationStats;
+  quantizeStats?: any;
+  staffAssignment?: any;
+}
+
 export interface AudioState {
   isPlaying: boolean;
   currentTime: number;
