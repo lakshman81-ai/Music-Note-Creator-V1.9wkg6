@@ -8,11 +8,31 @@ const BEATS_PER_MEASURE = 4; // Assuming 4/4 for now
 const MIDDLE_C = 60;
 const STAFF_SPACE = 10; // VexFlow default reference (approx)
 
+/* Configurable constants for Staff/Slur/Beam logic */
+const LEDGER_LIMIT = 3;          // max ledger lines acceptable on assigned staff
+const FASTPATH_LOW = 53;         // move to bass if midi < 53 (approx 3 ledgers below treble)
+const FASTPATH_HIGH = 69;        // move to treble if midi > 69 (approx 3 ledgers above bass)
+const SLUR_GAP_BEATS = 1 / 32;   // gap threshold for slur detection (beats)
+const SLUR_MAX_NOTES = 8;        // maximum slur length to auto-detect
+const MIN_BEAMABLE = 0.5;        // durations <= this (eighth notes) are beamable
+const BEAM_BREAK_AT_BEAT = true; // whether to break beams at beat boundaries
+
+/* Mapping reference: middle-line MIDI approximations */
+const TREBLE_MIDDLE_MIDI = 71; // B4 as middle line reference
+const BASS_MIDDLE_MIDI = 50;   // D3 as middle line reference
+
 export interface Measure {
   index: number;
   startBeat: number;
   endBeat: number;
   notes: NoteEvent[];
+}
+
+export interface StaffInfo {
+  id: string;
+  clef: 'treble' | 'bass';
+  centerY?: number;
+  staff_space?: number;
 }
 
 export const MusicNotationService = {
@@ -22,27 +42,35 @@ export const MusicNotationService = {
   processNotes(rawNotes: NoteEvent[], bpm: number): Measure[] {
     if (rawNotes.length === 0) return [];
 
+    // 0. Define Staves
+    const staves: StaffInfo[] = [
+        { id: 'treble', clef: 'treble' },
+        { id: 'bass', clef: 'bass' }
+    ];
+
     // 1. Quantization & Normalization
     const quantizedNotes = this.quantizeNotes(rawNotes, bpm);
 
     // 2. Measure Splitting (with Ties)
+    // We split before staff assignment to ensuring long notes are broken into measures correctly
+    // (User instructions allow splitting before or after, keeping before for grouping consistency)
     const splitNotes = this.splitAcrossMeasures(quantizedNotes);
 
-    // 3. Staff Assignment
-    const staffAssignedNotes = this.assignStaves(splitNotes);
+    // 3. Staff Assignment (New Logic)
+    this.assignStaves(splitNotes, staves);
 
-    // 4. Group into Measures for further processing
-    const measures = this.groupIntoMeasures(staffAssignedNotes);
+    // 4. Group into Measures
+    const measures = this.groupIntoMeasures(splitNotes);
 
-    // 5. Voice Assignment & Rests (Per Measure)
+    // 5. Voice Assignment & Slurs/Beams & Rests (Per Measure)
     measures.forEach(m => {
-        // Voice Assignment
+        // Voice Assignment (Existing Logic)
         this.assignVoices(m.notes);
 
-        // Slurs & Beams (after voice assignment)
-        this.detectSlursAndBeams(m.notes);
+        // Slurs & Beams (New Logic)
+        this.detectSlursAndBeams(m.notes, BEATS_PER_MEASURE);
 
-        // Fill Rests
+        // Fill Rests (Existing Logic)
         m.notes = this.fillMeasureWithRests(m.notes, m.startBeat, m.endBeat);
     });
 
@@ -102,8 +130,6 @@ export const MusicNotationService = {
                   else if (!isFirst && !isLast) tie = 'continue';
                   else if (!isFirst && isLast) tie = 'stop';
               }
-              // Special case: Single note split crossing 2 bars (start -> stop)
-              // If it crosses >2 bars, the middle ones are 'continue'
 
               // Clone and adjust
               const chunk: NoteEvent = {
@@ -123,61 +149,72 @@ export const MusicNotationService = {
       return processed.sort((a, b) => a.startBeat! - b.startBeat! || a.midi_pitch - b.midi_pitch);
   },
 
-  assignStaves(notes: NoteEvent[]): NoteEvent[] {
-      // 1. First pass: Nearest staff with threshold
-      return notes.map(note => {
-          // Approximate Y positions (VexFlow logic inverted: higher Y is lower pitch)
-          // Middle C (C4, 60) is roughly center.
-          // Treble Center: B4 (71)
-          // Bass Center: D3 (50)
+  /**
+   * Helper: approximate ledger-lines count for a staff for a given midi pitch
+   */
+  ledgerLinesForStaff(midi:number, clef: 'treble' | 'bass'): number {
+      const middle = clef === 'treble' ? TREBLE_MIDDLE_MIDI : BASS_MIDDLE_MIDI;
+      const semitoneDelta = midi - middle;
+      const pos = Math.round(Math.abs(semitoneDelta) / 1);
+      const positionsInside = 4;
+      const extraPositions = Math.max(0, pos - positionsInside);
+      const ledger = Math.ceil(extraPositions / 2);
+      return ledger;
+  },
 
-          const distToTreble = Math.abs(note.midi_pitch - 71);
-          const distToBass = Math.abs(note.midi_pitch - 50);
+  /**
+   * Choose staff for a single midi pitch given available staves.
+   */
+  chooseStaffForMidi(midi:number, staves: StaffInfo[]): StaffInfo {
+      if (!staves || staves.length === 0) throw new Error('chooseStaffForMidi: no staves provided');
 
-          // Threshold: 2 spaces = approx 3.5 semitones?
-          // In staff steps: 1 space = 2 steps (line/space).
-          // Let's use semitones as proxy. Staff space is ~3-4 semitones depending on key.
-          // User rule: "vertical_distance_to_staff <= 2 * staff_space"
-          // Let's stick to simple MIDI split with "Ledger Line Limit" override.
+      // 1) compute ledger-line cost
+      const scored = staves.map(s => ({ staff: s, ledger: this.ledgerLinesForStaff(midi, s.clef) }));
+      scored.sort((a,b) => a.ledger - b.ledger); // ascending ledger preference
 
-          let staff: 'treble' | 'bass' = 'treble';
+      // Fast accept if lowest ledger within acceptable limit
+      if (scored[0].ledger <= LEDGER_LIMIT) return scored[0].staff;
 
-          // Ledger line logic:
-          // Treble range w/o ledgers: D4 (62) to G5 (79)
-          // Bass range w/o ledgers: F2 (41) to B3 (59)
+      // Fast-path heuristics
+      if (midi < FASTPATH_LOW) {
+          const bass = staves.find(s => s.clef === 'bass');
+          if (bass) return bass;
+      }
+      if (midi > FASTPATH_HIGH) {
+          const treble = staves.find(s => s.clef === 'treble');
+          if (treble) return treble;
+      }
 
-          // If > 3 ledger lines (approx > 6 steps outside stave)
-          // Treble Top Ledgers start > A5. 3 ledgers ~ E6+
-          // Treble Bottom Ledgers start < C4. 3 ledgers ~ G3-
+      // Otherwise choose minimal ledger
+      return scored[0].staff;
+  },
 
-          // Bass Top Ledgers start > C4. 3 ledgers ~ A4+
-          // Bass Bottom Ledgers start < E2. 3 ledgers ~ B1-
+  assignStaves(notes: NoteEvent[], staves: StaffInfo[]) {
+      const stats = {
+          movedToBass: 0,
+          movedToTreble: 0,
+          kept: 0,
+          ambiguous: 0
+      };
 
-          if (note.midi_pitch >= 60) {
-              staff = 'treble';
-          } else {
-              staff = 'bass';
+      for (const n of notes) {
+          if (typeof n.midi_pitch !== 'number') {
+              if (!n.staff) { stats.ambiguous++; continue; }
+              stats.kept++;
+              continue;
+          }
+          const chosen = this.chooseStaffForMidi(n.midi_pitch, staves);
+
+          if (n.staff && n.staff === chosen.clef) { stats.kept++; continue; }
+
+          if (n.staff && n.staff !== chosen.clef) {
+              if (chosen.clef === 'bass') stats.movedToBass++;
+              else if (chosen.clef === 'treble') stats.movedToTreble++;
           }
 
-          // Fallback / Ledger Optimization
-          // If note is 55 (G3), standard is Bass.
-          // If note is 65 (F4), standard is Treble.
-
-          // Ambiguous zone: 50-70.
-          // If note is very high (e.g. 85), strictly Treble.
-          // If note is very low (e.g. 35), strictly Bass.
-
-          // Ambiguity Check (Rule 2 from plan)
-          // If >3 ledgers on assigned staff, try swap.
-
-          // Treble 3 ledgers low: < 50 (D3)
-          // Bass 3 ledgers high: > 72 (C5)
-
-          if (staff === 'treble' && note.midi_pitch < 50) staff = 'bass';
-          if (staff === 'bass' && note.midi_pitch > 72) staff = 'treble';
-
-          return { ...note, staff };
-      });
+          n.staff = chosen.clef;
+      }
+      // console.log("Staff Assignment Stats:", stats);
   },
 
   groupIntoMeasures(notes: NoteEvent[]): Measure[] {
@@ -200,30 +237,14 @@ export const MusicNotationService = {
   },
 
   assignVoices(notes: NoteEvent[]) {
-      // Group overlapping notes
-      // Simple strategy: Iterate sorted notes. If overlap, assign alternate voice.
-
-      // Separate by staff first
       ['treble', 'bass'].forEach(staffType => {
           const staffNotes = notes.filter(n => n.staff === staffType);
           if (staffNotes.length === 0) return;
 
-          // Detect overlaps
-          // Map of beat -> usedVoices[]
-          // Since we have quantized time, we can check collisions easily.
+          staffNotes.forEach(note => note.voice = 1);
 
-          // Greedy assignment
-          staffNotes.forEach(note => {
-             // Default Voice 1
-             note.voice = 1;
-          });
-
-          // Check for collisions
           for (let i = 0; i < staffNotes.length; i++) {
               const current = staffNotes[i];
-              // Check against previous notes that might still be sustaining
-              // (Actually, checking overlapping intervals in local window is O(N^2) but N is small per measure)
-
               const overlapping = staffNotes.filter(other =>
                   other !== current &&
                   other.startBeat! < (current.startBeat! + current.durationBeats!) &&
@@ -231,134 +252,117 @@ export const MusicNotationService = {
               );
 
               if (overlapping.length > 0) {
-                  // Collision detected.
-                  // If "current" starts at same time as "other", it's a chord -> Same Voice.
-                  // If "current" starts different time -> Polyphony -> Different Voice.
-
-                  const chordMates = overlapping.filter(o => Math.abs(o.startBeat! - current.startBeat!) < 0.001);
                   const polyphonyMates = overlapping.filter(o => Math.abs(o.startBeat! - current.startBeat!) >= 0.001);
-
-                  // Chord Mates share voice of current (already 1).
-                  // Polyphony mates need different voices.
-
-                  // If I have a polyphony mate that is already assigned voice 1, I must be voice 2.
                   const usedVoices = new Set(polyphonyMates.map(p => p.voice));
                   if (usedVoices.has(1)) {
                       current.voice = 2;
                   }
-                  // If >2 voices needed?
                   if (usedVoices.has(1) && usedVoices.has(2)) {
-                      // Fallback: cycle
-                      current.voice = 1; // Simplify to 2 voices max for now, or use logic
+                      current.voice = 1;
                   }
               }
           }
       });
   },
 
-  detectSlursAndBeams(notes: NoteEvent[]) {
-      // Per Staff, Per Voice
-      ['treble', 'bass'].forEach(staffType => {
-          [1, 2].forEach(voiceId => {
-              const voiceNotes = notes.filter(n => n.staff === staffType && n.voice === voiceId);
-              voiceNotes.sort((a,b) => a.startBeat! - b.startBeat!);
+  detectSlursAndBeams(notes: NoteEvent[], beatsPerMeasure: number) {
+      const slurGroups: Record<string, string[]> = {};
+      const beamGroups: Record<string, string[]> = {};
 
-              if (voiceNotes.length < 2) return;
+      // Group notes by staff+voice+measure for slurs (voice-aware)
+      const byVoiceMeasure = new Map<string, NoteEvent[]>();
+      for (const n of notes) {
+          const voice = (n.voice ?? 1);
+          const staff = n.staff ?? 'treble';
+          const measureIndex = Math.floor(n.startBeat! / beatsPerMeasure);
+          const key = `${staff}|${voice}|m${measureIndex}`;
+          if (!byVoiceMeasure.has(key)) byVoiceMeasure.set(key, []);
+          byVoiceMeasure.get(key)!.push(n);
+      }
 
-              // SLURS
-              let slurGroup: NoteEvent[] = [];
-              voiceNotes.forEach((note, idx) => {
-                  if (idx === 0) {
-                      slurGroup.push(note);
-                      return;
+      // SLUR DETECTION
+      let slurIdCounter = 0;
+      for (const [key, arr] of byVoiceMeasure.entries()) {
+          arr.sort((a,b) => a.startBeat! - b.startBeat! || (b.midi_pitch - a.midi_pitch));
+          let currentGroup: NoteEvent[] = [];
+          for (let i = 0; i < arr.length; i++) {
+              const cur = arr[i];
+              if (currentGroup.length === 0) { currentGroup.push(cur); continue; }
+              const prev = currentGroup[currentGroup.length - 1];
+              const prevEnd = prev.startBeat! + prev.durationBeats!;
+              const gap = cur.startBeat! - prevEnd;
+              if (gap <= SLUR_GAP_BEATS && cur.startBeat! >= prev.startBeat!) {
+                  currentGroup.push(cur);
+                  if (currentGroup.length >= SLUR_MAX_NOTES) {
+                      const id = `slur_${slurIdCounter++}`;
+                      slurGroups[id] = currentGroup.map(x => x.id);
+                      for (const x of currentGroup) x.slurId = id;
+                      currentGroup = [];
                   }
-                  const prev = voiceNotes[idx-1];
-                  const gap = note.startBeat! - (prev.startBeat! + prev.durationBeats!);
-
-                  // Rule: Gap < 1/32
-                  if (gap < (1/32 + 0.001) && slurGroup.length < 8) {
-                      slurGroup.push(note);
-                  } else {
-                      // Finalize previous group
-                      if (slurGroup.length > 2) { // Minimum 3 notes for meaningful automatic slur? Or 2?
-                         // User said "Slur when same voice and gap < 1/32... max 8".
-                         // Usually 2 notes is a slur.
-                         const id = `slur_${prev.id}`;
-                         slurGroup.forEach(n => n.slurId = id);
-                      }
-                      slurGroup = [note];
+              } else {
+                  if (currentGroup.length > 1) {
+                      const id = `slur_${slurIdCounter++}`;
+                      slurGroups[id] = currentGroup.map(x => x.id);
+                      for (const x of currentGroup) x.slurId = id;
                   }
-              });
-              // Flush last slur
-              if (slurGroup.length >= 2) {
-                   const id = `slur_${voiceNotes[voiceNotes.length-1].id}`;
-                   slurGroup.forEach(n => n.slurId = id);
+                  currentGroup = [cur];
               }
+          }
+          if (currentGroup.length > 1) {
+              const id = `slur_${slurIdCounter++}`;
+              slurGroups[id] = currentGroup.map(x => x.id);
+              for (const x of currentGroup) x.slurId = id;
+          }
+      }
 
-              // BEAMS
-              // Group consecutive 8th (0.5) or 16th (0.25) or 32nd notes within the same beat?
-              // Standard beaming: By beat (quarter note chunks)
-              let beamGroup: NoteEvent[] = [];
+      // BEAM GROUPS
+      const beamableNotesByContext = new Map<string, NoteEvent[]>();
+      for (const n of notes) {
+          if (n.durationBeats! <= MIN_BEAMABLE) {
+              const v = (n.voice ?? 1);
+              const context = `${n.staff ?? 'treble'}|${v}|m${Math.floor(n.startBeat! / beatsPerMeasure)}`;
+              if (!beamableNotesByContext.has(context)) beamableNotesByContext.set(context, []);
+              beamableNotesByContext.get(context)!.push(n);
+          }
+      }
 
-              voiceNotes.forEach((note, idx) => {
-                  const isBeamable = note.durationBeats! <= 0.5; // 8th or smaller
+      let beamIdCounter = 0;
+      for (const [ctx, arr] of beamableNotesByContext.entries()) {
+          const sorted = arr.slice().sort((a,b) => a.startBeat! - b.startBeat! || b.midi_pitch - a.midi_pitch);
+          let currentBeam: NoteEvent[] = [];
+          for (let i = 0; i < sorted.length; i++) {
+              const cur = sorted[i];
+              if (currentBeam.length === 0) { currentBeam.push(cur); continue; }
+              const prev = currentBeam[currentBeam.length - 1];
 
-                  if (!isBeamable) {
-                      // Close previous beam
-                      if (beamGroup.length > 1) {
-                          const id = `beam_${beamGroup[0].id}`;
-                          beamGroup.forEach(n => n.beamId = id);
-                      }
-                      beamGroup = [];
-                      return;
+              const sameTick = Math.abs(cur.startBeat! - prev.startBeat!) < (1 / (GRID_DENOM * 100));
+              const prevBeatIndex = Math.floor(prev.startBeat!);
+              const curBeatIndex = Math.floor(cur.startBeat!);
+              const crossesBeat = BEAM_BREAK_AT_BEAT && (prevBeatIndex !== curBeatIndex);
+              const gap = cur.startBeat! - (prev.startBeat! + prev.durationBeats!);
+              const beamGapTolerance = 1 / GRID_DENOM;
+
+              if (sameTick || (!crossesBeat && gap <= beamGapTolerance)) {
+                  currentBeam.push(cur);
+              } else {
+                  if (currentBeam.length >= 2) {
+                      const id = `beam_${beamIdCounter++}`;
+                      beamGroups[id] = currentBeam.map(x => x.id);
+                      for (const x of currentBeam) x.beamId = id;
                   }
-
-                  // Check if fits in current beam group (same beat block)
-                  // e.g. beat 1.0 to 1.99
-                  const currentBeatFloor = Math.floor(note.startBeat!);
-
-                  if (beamGroup.length > 0) {
-                       const prevBeatFloor = Math.floor(beamGroup[0].startBeat!);
-                       const prevEnd = beamGroup[beamGroup.length-1].startBeat! + beamGroup[beamGroup.length-1].durationBeats!;
-                       const gap = note.startBeat! - prevEnd;
-
-                       if (currentBeatFloor === prevBeatFloor && gap < 0.001) {
-                           beamGroup.push(note);
-                       } else {
-                           // Close and start new
-                           if (beamGroup.length > 1) {
-                               const id = `beam_${beamGroup[0].id}`;
-                               beamGroup.forEach(n => n.beamId = id);
-                           }
-                           beamGroup = [note];
-                       }
-                  } else {
-                      beamGroup.push(note);
-                  }
-              });
-               // Flush last beam
-              if (beamGroup.length > 1) {
-                   const id = `beam_${beamGroup[0].id}`;
-                   beamGroup.forEach(n => n.beamId = id);
+                  currentBeam = [cur];
               }
-          });
-      });
+          }
+          if (currentBeam.length >= 2) {
+              const id = `beam_${beamIdCounter++}`;
+              beamGroups[id] = currentBeam.map(x => x.id);
+              for (const x of currentBeam) x.beamId = id;
+          }
+      }
+      // return { slurGroups, beamGroups };
   },
 
   fillMeasureWithRests(notes: NoteEvent[], measureStart: number, measureEnd: number): NoteEvent[] {
-      // 1. Map occupied intervals per staff/voice?
-      // Rests are usually shared if voices are silent? Or per voice?
-      // Standard engraving: If Measure is polyphonic, each voice needs rests.
-      // If monophonic, one rest line.
-
-      // For simplicity/AI output: Treat "Global" rests if no notes play at all?
-      // Or Per Staff?
-      // Let's do Per Staff. If Treble is empty, full rest.
-      // If Treble has gaps, fill gaps.
-      // Voices: If voice 2 is used in measure, it needs rests. If voice 1 is used...
-      // This gets complex. Simplified:
-      // Fill "Voice 1" gaps on each staff. Ignore Voice 2 gaps to avoid clutter unless strictly required.
-
       const filledNotes = [...notes];
 
       ['treble', 'bass'].forEach(staff => {
@@ -367,19 +371,14 @@ export const MusicNotationService = {
 
           let cursor = measureStart;
 
-          // Insert rests before first note
           if (staffNotes.length > 0) {
                if (staffNotes[0].startBeat! > cursor) {
                    const gaps = this.generateRestEvents(cursor, staffNotes[0].startBeat!, staff as 'treble'|'bass');
                    filledNotes.push(...gaps);
                }
                cursor = staffNotes[0].startBeat! + staffNotes[0].durationBeats!;
-          } else {
-               // Empty staff -> Full measure rest
-               // But wait, if NO notes in measure, generateRestEvents handles it?
           }
 
-          // Gaps between notes
           for (let i = 0; i < staffNotes.length - 1; i++) {
               const currentEnd = staffNotes[i].startBeat! + staffNotes[i].durationBeats!;
               const nextStart = staffNotes[i+1].startBeat!;
@@ -389,7 +388,6 @@ export const MusicNotationService = {
               }
           }
 
-          // Gap after last note
           if (staffNotes.length > 0) {
               const lastEnd = staffNotes[staffNotes.length-1].startBeat! + staffNotes[staffNotes.length-1].durationBeats!;
               if (lastEnd < measureEnd - 0.001) {
@@ -397,7 +395,6 @@ export const MusicNotationService = {
                    filledNotes.push(...gaps);
               }
           } else {
-              // Whole measure rest
               const gaps = this.generateRestEvents(measureStart, measureEnd, staff as 'treble'|'bass');
               filledNotes.push(...gaps);
           }
@@ -414,25 +411,23 @@ export const MusicNotationService = {
       let remaining = duration;
       let currentPos = start;
 
-      // Greedy denomination
-      const denoms = [4, 2, 1, 0.5, 0.25, 0.125, 0.03125]; // Whole, Half, Quarter, 8th, 16th, 32nd
+      const denoms = [4, 2, 1, 0.5, 0.25, 0.125, 0.03125];
 
-      while (remaining >= 0.03125) { // 1/32
-           // Find largest fit
+      while (remaining >= 0.03125) {
            const fit = denoms.find(d => d <= remaining + 0.001);
            if (!fit) break;
 
            rests.push({
-               id: `rest_${staff}_${currentPos}_${Math.random()}`, // unique ID
-               start_time: 0, // irrelevant for display
+               id: `rest_${staff}_${currentPos}_${Math.random()}`,
+               start_time: 0,
                duration: 0,
-               midi_pitch: 0, // irrelevant
+               midi_pitch: 0,
                velocity: 0,
                confidence: 1,
                startBeat: currentPos,
                durationBeats: fit,
                staff: staff,
-               voice: 1, // Rests usually voice 1
+               voice: 1,
                isRest: true,
                pitch_label: ''
            });
@@ -443,15 +438,7 @@ export const MusicNotationService = {
       return rests;
   },
 
-  /**
-   * Helper to convert duration in beats to VexFlow duration string
-   * e.g., 1 -> "q", 2 -> "h", 4 -> "w", 0.5 -> "8"
-   */
   getVexFlowDuration(beats: number): string {
-      // Handle dots
-      // 1.5 -> qd, 3 -> hd, 0.75 -> 8d
-
-      // Simple lookup for standard values
       if (Math.abs(beats - 4) < 0.01) return "w";
       if (Math.abs(beats - 3) < 0.01) return "hd";
       if (Math.abs(beats - 2) < 0.01) return "h";
@@ -459,11 +446,10 @@ export const MusicNotationService = {
       if (Math.abs(beats - 1) < 0.01) return "q";
       if (Math.abs(beats - 0.75) < 0.01) return "8d";
       if (Math.abs(beats - 0.5) < 0.01) return "8";
-      if (Math.abs(beats - 0.375) < 0.01) return "16d"; // dotted 16th
+      if (Math.abs(beats - 0.375) < 0.01) return "16d";
       if (Math.abs(beats - 0.25) < 0.01) return "16";
       if (Math.abs(beats - 0.125) < 0.01) return "32";
 
-      // Fallback for weird tuplets or glitches: round to nearest
       if (beats > 3.5) return "w";
       if (beats > 1.8) return "h";
       if (beats > 0.8) return "q";
