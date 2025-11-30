@@ -29,6 +29,11 @@ export interface NoteEvent {
   slurId?: string | null; // Identifier for slur groups
   beamId?: string | null; // Identifier for beam groups
   isRest?: boolean; // explicit rest
+
+  // Validation & QA
+  isUncertain?: boolean;
+  quantizeErrorBeats?: number;
+  remediationFlags?: string[];
 }
 
 export interface AudioState {
