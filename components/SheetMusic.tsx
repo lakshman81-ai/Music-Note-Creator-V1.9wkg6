@@ -45,6 +45,10 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
   // Memoize measures for rendering efficiency and to use in axis generation
   const { measures, diagnostics } = useMemo(() => {
       const result = MusicNotationService.processNotes(notes, bpm);
+      // Log diagnostics for QA visibility
+      if (result.diagnostics.slurValidation.totalSlursAttempted > 0) {
+          console.log('[SlurValidation]', result.diagnostics.slurValidation);
+      }
       return result;
   }, [notes, bpm]);
 
