@@ -16,7 +16,17 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null);
   const [isReady, setIsReady] = useState(false);
 
-  // Initialize OSMD
+  // Constants
+  const BASE_MEASURE_WIDTH = 220; // Recommended minimum
+  const STAFF_SPACE = 10;
+  
+  // Memoize measures for rendering efficiency and to use in axis generation
+  const { measures, diagnostics } = useMemo(() => {
+      const result = MusicNotationService.processNotes(notes, bpm);
+      return result;
+  }, [notes, bpm]);
+
+  // Logic: Sync scroll to playhead
   useEffect(() => {
     if (!containerRef.current) return;
 
