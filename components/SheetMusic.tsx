@@ -1,6 +1,20 @@
 
 import React, { useEffect, useRef, useMemo } from 'react';
-import * as Vex from 'vexflow';
+import {
+    Renderer,
+    Stave,
+    StaveNote,
+    StaveConnector,
+    Accidental,
+    Dot,
+    Formatter,
+    Voice,
+    Beam,
+    Curve,
+    StaveTie,
+    Annotation,
+    Modifier
+} from 'vexflow';
 import { NoteEvent, LabelSettings } from '../types';
 import { MusicNotationService } from '../services/musicNotationService';
 
@@ -20,8 +34,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
     notes, currentTime, totalDuration, bpm = 120, onNoteClick, selectedNoteId, labelSettings, scrollRef, onScroll 
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  // @ts-ignore
-  const rendererRef = useRef<Vex.Flow.Renderer | null>(null);
+  const rendererRef = useRef<Renderer | null>(null);
 
   // Constants
   const MEASURE_WIDTH = 300; // Increased for better spacing
@@ -65,19 +78,12 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       }
 
       // 2. Setup VexFlow Renderer
-      // VexFlow 4.x ESM export handling - Robust Check
-      // @ts-ignore
-      const VF = Vex.Flow || (Vex.default && Vex.default.Flow) || Vex;
+      // We assume VexFlow loaded fonts via side-effect import in main file or component
       
-      if (!VF || !VF.Renderer) {
-          console.error("VexFlow library not loaded correctly", Vex);
-          return;
-      }
-
       const width = Math.max(800, measures.length * MEASURE_WIDTH + 50);
       const height = 350; // Treble + Bass + spacing
 
-      const renderer = new VF.Renderer(containerRef.current, VF.Renderer.Backends.SVG);
+      const renderer = new Renderer(containerRef.current, Renderer.Backends.SVG);
       renderer.resize(width, height);
       const context = renderer.getContext();
       rendererRef.current = renderer;
@@ -105,8 +111,8 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
 
           // Connect staves with brace at start
           if (i === 0) {
-              new VF.StaveConnector(staveTreble, staveBass).setType(VF.StaveConnector.type.BRACE).setContext(context).draw();
-              new VF.StaveConnector(staveTreble, staveBass).setType(VF.StaveConnector.type.SINGLE_LEFT).setContext(context).draw();
+              new StaveConnector(staveTreble, staveBass).setType(StaveConnector.type.BRACE).setContext(context).draw();
+              new StaveConnector(staveTreble, staveBass).setType(StaveConnector.type.SINGLE_LEFT).setContext(context).draw();
           }
           // Barline at end
           new VF.StaveConnector(staveTreble, staveBass).setType(VF.StaveConnector.type.SINGLE_RIGHT).setContext(context).draw();
@@ -430,7 +436,6 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       const beatsPerSecond = bpm / 60;
       const currentBeat = currentTime * beatsPerSecond;
       const pixelsPerBeat = MEASURE_WIDTH / 4; 
-      // 10px margin + 20px padding approximation for the start
       return 30 + (currentBeat * pixelsPerBeat);
   }, [currentTime, bpm]);
 
@@ -449,10 +454,9 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
             {measures.length > 0 && (
                 <div className="absolute bottom-0 left-0 w-full h-8 border-t border-zinc-100 pointer-events-none">
                     {measures.map((m, i) => {
-                        // Measures are 4 beats (4/4 assumed for now)
                         const secondsPerMeasure = (4 * 60) / bpm;
                         const time = i * secondsPerMeasure;
-                        const left = 10 + (i * MEASURE_WIDTH); // Matches VexFlow currentX start
+                        const left = 10 + (i * MEASURE_WIDTH);
                         return (
                             <div key={i} className="absolute top-0 flex flex-col items-start h-full" style={{ left: `${left}px` }}>
                                 <div className="h-1.5 w-px bg-zinc-300"></div>
