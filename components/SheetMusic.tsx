@@ -96,7 +96,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       }, 0);
       
       const width = Math.max(800, totalWidth + 50);
-      const height = 350; // Treble + Bass + spacing
+      const height = 380; // Treble + Bass + spacing + Time Axis
 
       const renderer = new Renderer(containerRef.current, Renderer.Backends.SVG);
       renderer.resize(width, height);
@@ -109,11 +109,21 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       // 3. Render Measures Loop
       let currentX = 10;
       
+      // Store measure X coordinates for Timeline generation
+      const measureXCoords: { startX: number; endX: number; startBeat: number; endBeat: number }[] = [];
+
       measures.forEach((measure, i) => {
           // Calculate Dynamic Width for this measure (Exact Formula)
           const noteCount = measure.notes.length;
           const noteDensity = noteCount / 4; // beatsPerMeasure
           const dynamicWidth = Math.max(220, 220 + (noteDensity * STAFF_SPACE * 16));
+
+          measureXCoords.push({
+              startX: currentX,
+              endX: currentX + dynamicWidth,
+              startBeat: measure.startBeat,
+              endBeat: measure.endBeat
+          });
 
           // --- TREBLE STAVE ---
           const staveTreble = new Stave(currentX, 40, dynamicWidth);
@@ -322,12 +332,15 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   if (n.tie === 'start' || n.tie === 'continue') {
                       if (j < tickables.length - 1) {
                           const nextT = tickables[j+1];
-                          new StaveTie({
-                              first_note: t,
-                              last_note: nextT,
-                              first_indices: [0],
-                              last_indices: [0]
-                          }).setContext(context).draw();
+                          // Validate existence to prevent "BadArguments" error
+                          if (t && nextT) {
+                              new StaveTie({
+                                  first_note: t,
+                                  last_note: nextT,
+                                  first_indices: [0],
+                                  last_indices: [0]
+                              }).setContext(context).draw();
+                          }
                       }
                   }
 
@@ -367,6 +380,83 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
           
           currentX += dynamicWidth;
       });
+
+      // --- TIMELINE AXIS ---
+      // Draw continuous line and ticks
+      if (measures.length > 0) {
+          const axisY = 300;
+          context.save();
+          context.setStrokeStyle("#3f3f46"); // Zinc-700
+          context.setLineWidth(1);
+          context.setFont("monospace", 10, "");
+          context.setFillStyle("#52525b"); // Zinc-600
+
+          // Draw main horizontal line
+          context.beginPath();
+          context.moveTo(10, axisY);
+          context.lineTo(width - 40, axisY); // Leave some padding
+          context.stroke();
+
+          // Calculate time range
+          const firstBeat = measures[0].startBeat;
+          const lastMeasure = measures[measures.length - 1];
+          const lastBeat = lastMeasure.endBeat;
+          const totalBeats = lastBeat - firstBeat;
+          const totalSeconds = (totalBeats * 60) / bpm;
+
+          // Decide tick interval (approx every 1 second, or 2s, 5s depending on zoom/bpm)
+          // We want ticks roughly every 100-200 pixels?
+          // Let's stick to 1 second intervals if possible, or 2s if too dense.
+          let tickIntervalSec = 1;
+          if (bpm > 180) tickIntervalSec = 0.5;
+          if (bpm < 60) tickIntervalSec = 2;
+
+          const startSec = (firstBeat * 60) / bpm;
+          const endSec = (lastBeat * 60) / bpm;
+
+          for (let sec = Math.ceil(startSec); sec <= endSec; sec += tickIntervalSec) {
+              // Map seconds -> beat -> X
+              const beat = (sec * bpm) / 60;
+
+              // Find containing measure
+              const measureInfo = measureXCoords.find(m => beat >= m.startBeat && beat < m.endBeat);
+
+              let x = 0;
+              if (measureInfo) {
+                  // Interpolate within measure
+                  const progress = (beat - measureInfo.startBeat) / (measureInfo.endBeat - measureInfo.startBeat);
+                  const measureWidth = measureInfo.endX - measureInfo.startX;
+                  // Note: VexFlow staves have some padding (begin_x), usually around 10-15px relative to x.
+                  // Stave.getNoteStartX() usually gives the first note position.
+                  // We'll use linear interpolation over the stave width for simplicity.
+                  // Note: The first note usually starts after clef/time sig in measure 0.
+                  // measureInfo.startX is the raw x passed to Stave constructor.
+                  // The actual content area starts slightly offset.
+                  // However, for the axis, linear interpolation over the visual block is acceptable.
+                  x = measureInfo.startX + (progress * measureWidth);
+              } else {
+                  // Handle edge case if exactly at endBeat
+                   if (Math.abs(beat - lastBeat) < 0.01) {
+                       const last = measureXCoords[measureXCoords.length-1];
+                       x = last.endX;
+                   }
+              }
+
+              if (x > 0) {
+                  // Draw Tick
+                  context.beginPath();
+                  context.moveTo(x, axisY);
+                  context.lineTo(x, axisY + 5);
+                  context.stroke();
+
+                  // Draw Label
+                  const label = `${sec}s`;
+                  const textWidth = context.measureText(label).width;
+                  context.fillText(label, x - (textWidth / 2), axisY + 15);
+              }
+          }
+          context.restore();
+      }
       
   }, [measures, bpm, labelSettings, selectedNoteId]);
 
