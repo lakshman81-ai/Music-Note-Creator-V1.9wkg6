@@ -43,8 +43,13 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
   const STAFF_SPACE = 10;
   
   // Memoize measures for rendering efficiency and to use in axis generation
-  const measures = useMemo(() => {
-      return MusicNotationService.processNotes(notes, bpm);
+  const { measures, diagnostics } = useMemo(() => {
+      const result = MusicNotationService.processNotes(notes, bpm);
+      // Log diagnostics for QA visibility
+      if (result.diagnostics.slurValidation.totalSlursAttempted > 0) {
+          console.log('[SlurValidation]', result.diagnostics.slurValidation);
+      }
+      return result;
   }, [notes, bpm]);
 
   // Logic: Sync scroll to playhead
@@ -91,7 +96,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       }, 0);
       
       const width = Math.max(800, totalWidth + 50);
-      const height = 350; // Treble + Bass + spacing
+      const height = 380; // Treble + Bass + spacing + Time Axis
 
       const renderer = new Renderer(containerRef.current, Renderer.Backends.SVG);
       renderer.resize(width, height);
@@ -109,6 +114,18 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
           const noteCount = measure.notes.length;
           const noteDensity = noteCount / 4; // beatsPerMeasure
           const dynamicWidth = Math.max(220, 220 + (noteDensity * STAFF_SPACE * 16));
+
+          // --- TIME AXIS LABEL ---
+          const measureTime = (measure.startBeat * 60) / bpm;
+          const timeLabel = measureTime < 60
+              ? `${measureTime.toFixed(0)}s`
+              : `${Math.floor(measureTime/60)}:${(measureTime%60).toFixed(0).padStart(2,'0')}`;
+
+          context.save();
+          context.setFont("Inter", 10, "bold");
+          context.setFillStyle("#71717a"); // Zinc-500
+          context.fillText(timeLabel, currentX + 5, 300); // Below Bass Stave
+          context.restore();
 
           // --- TREBLE STAVE ---
           const staveTreble = new Stave(currentX, 40, dynamicWidth);
@@ -317,12 +334,15 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   if (n.tie === 'start' || n.tie === 'continue') {
                       if (j < tickables.length - 1) {
                           const nextT = tickables[j+1];
-                          new StaveTie({
-                              first_note: t,
-                              last_note: nextT,
-                              first_indices: [0],
-                              last_indices: [0]
-                          }).setContext(context).draw();
+                          // Validate existence to prevent "BadArguments" error
+                          if (t && nextT) {
+                              new StaveTie({
+                                  first_note: t,
+                                  last_note: nextT,
+                                  first_indices: [0],
+                                  last_indices: [0]
+                              }).setContext(context).draw();
+                          }
                       }
                   }
 
