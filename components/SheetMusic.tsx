@@ -13,7 +13,9 @@ import {
     Curve,
     StaveTie,
     Annotation,
-    Modifier
+    Modifier,
+    Font,
+    Fraction,
 } from 'vexflow';
 import { NoteEvent, LabelSettings } from '../types';
 import { MusicNotationService } from '../services/musicNotationService';
@@ -37,7 +39,8 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
   const rendererRef = useRef<Renderer | null>(null);
 
   // Constants
-  const MEASURE_WIDTH = 300; // Increased for better spacing
+  const BASE_MEASURE_WIDTH = 250;
+  const STAFF_SPACE = 10;
   
   // Memoize measures for rendering efficiency and to use in axis generation
   const measures = useMemo(() => {
@@ -49,7 +52,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
     if (scrollRef && scrollRef.current) {
         const beatsPerSecond = bpm / 60;
         const currentBeat = currentTime * beatsPerSecond;
-        const pixelsPerBeat = MEASURE_WIDTH / 4;
+        const pixelsPerBeat = BASE_MEASURE_WIDTH / 4; // approximate
         
         // Offset: First stave padding (~20px)
         const playheadX = 20 + (currentBeat * pixelsPerBeat);
@@ -78,9 +81,13 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       }
 
       // 2. Setup VexFlow Renderer
-      // We assume VexFlow loaded fonts via side-effect import in main file or component
+      const totalWidth = measures.reduce((acc, m) => {
+          // Dynamic width calculation
+          const noteCount = m.notes.length;
+          return acc + Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+      }, 0);
       
-      const width = Math.max(800, measures.length * MEASURE_WIDTH + 50);
+      const width = Math.max(800, totalWidth + 50);
       const height = 350; // Treble + Bass + spacing
 
       const renderer = new Renderer(containerRef.current, Renderer.Backends.SVG);
@@ -95,15 +102,19 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       let currentX = 10;
       
       measures.forEach((measure, i) => {
+          // Calculate Dynamic Width for this measure
+          const noteCount = measure.notes.length;
+          const dynamicWidth = Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+
           // --- TREBLE STAVE ---
-          const staveTreble = new VF.Stave(currentX, 40, MEASURE_WIDTH);
+          const staveTreble = new Stave(currentX, 40, dynamicWidth);
           if (i === 0) {
               staveTreble.addClef("treble").addTimeSignature("4/4");
           }
           staveTreble.setContext(context).draw();
 
           // --- BASS STAVE ---
-          const staveBass = new VF.Stave(currentX, 160, MEASURE_WIDTH); // Spacing
+          const staveBass = new Stave(currentX, 160, dynamicWidth); // Spacing
           if (i === 0) {
               staveBass.addClef("bass").addTimeSignature("4/4");
           }
@@ -115,14 +126,11 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
               new StaveConnector(staveTreble, staveBass).setType(StaveConnector.type.SINGLE_LEFT).setContext(context).draw();
           }
           // Barline at end
-          new VF.StaveConnector(staveTreble, staveBass).setType(VF.StaveConnector.type.SINGLE_RIGHT).setContext(context).draw();
+          new StaveConnector(staveTreble, staveBass).setType(StaveConnector.type.SINGLE_RIGHT).setContext(context).draw();
 
           // --- NOTES GENERATION HELPER ---
-          const createVexNotes = (measureNotes: NoteEvent[], clef: string, staffVoiceNotes: NoteEvent[]) => {
+          const createVexNotes = (measureNotes: NoteEvent[], clef: string) => {
               if (measureNotes.length === 0) return [];
-
-              // Filter for this voice
-              // (Note: we need to handle rests here too, assume they are part of measureNotes)
 
               // Group by start time for chords
               const groups: {[key: number]: NoteEvent[]} = {};
@@ -132,43 +140,38 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   groups[t].push(n);
               });
 
-              const vfNotes: any[] = [];
+              const vfNotes: StaveNote[] = [];
               const sortedTimes = Object.keys(groups).map(Number).sort((a,b) => a-b);
               
               sortedTimes.forEach((time, idx) => {
                   const group = groups[time];
-                  // Determine Duration based on first note in group
                   const durBeats = group[0].durationBeats || 1;
                   const isRest = group[0].isRest;
+                  const voiceId = group[0].voice || 1;
 
                   let vfDur = MusicNotationService.getVexFlowDuration(durBeats);
-                  if (isRest) vfDur += "r"; // VexFlow rest syntax: "qr", "hr"
+                  if (isRest) vfDur += "r";
 
                   // Keys
                   let keys: string[] = [];
                   if (isRest) {
-                      // Rest position: B4 for treble, D3 for bass default
                       keys = [clef === 'treble' ? "b/4" : "d/3"];
                   } else {
-                      // Sort keys: VexFlow requires sorted keys for StaveNote?
-                      // Actually for StaveNote construction, it prefers ascending order usually.
-                      // But our label logic requires sorting too.
-                      // Let's sort ascending for VexFlow Keys.
+                      // Sort keys Ascending for StaveNote construction
                       const sortedGroup = [...group].sort((a,b) => a.midi_pitch - b.midi_pitch);
-
                       keys = sortedGroup.map(n => {
                           const noteLetter = n.pitch_label?.charAt(0).toLowerCase() || "c";
-                          // Robust octave calc
                           const octave = Math.floor(n.midi_pitch / 12) - 1;
                           return `${noteLetter}/${octave}`;
                       });
                   }
 
-                  const staveNote = new VF.StaveNote({
+                  const staveNote = new StaveNote({
                       keys,
                       duration: vfDur,
                       clef,
-                      stem_direction: group[0].voice === 2 ? VF.StaveNote.STEM_DOWN : VF.StaveNote.STEM_UP
+                      // Force Stem Direction
+                      stem_direction: voiceId === 2 ? StaveNote.STEM_DOWN : StaveNote.STEM_UP
                   });
 
                   // Metadata for mapping back
@@ -181,62 +184,57 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
 
                   if (!isRest) {
                       // --- ACCIDENTALS & DOTS ---
-                      group.sort((a,b) => a.midi_pitch - b.midi_pitch).forEach((n, i) => {
+                      const sortedGroup = [...group].sort((a,b) => a.midi_pitch - b.midi_pitch);
+                      sortedGroup.forEach((n, i) => {
                           const noteName = n.pitch_label || "";
                           if (noteName.includes("#") || noteName.includes("♯")) {
-                              staveNote.addModifier(new VF.Accidental("#"), i);
+                              staveNote.addModifier(new Accidental("#"), i);
                           } else if (noteName.includes("b") || noteName.includes("♭")) {
-                              staveNote.addModifier(new VF.Accidental("b"), i);
+                              staveNote.addModifier(new Accidental("b"), i);
                           } else if (noteName.includes("x")) {
-                              staveNote.addModifier(new VF.Accidental("##"), i);
+                              staveNote.addModifier(new Accidental("##"), i);
                           }
 
                           // Dots
                           if (vfDur.includes("d")) {
-                              staveNote.addDot(i);
+                              staveNote.addModifier(new Dot(), i);
                           }
                       });
 
                       // --- PITCH LABELS (Stacked High -> Low) ---
                       if (labelSettings.showLabels) {
-                          // We need to attach labels to the correct notehead index.
-                          // staveNote keys are sorted Ascending (Low -> High).
-                          // i=0 is Lowest Note.
-                          
-                          // We want to Stack Labels:
-                          // If Chords: Labels should be placed outside?
-                          // The requirement: "Sort pitch labels for each chord from highest pitch → lowest pitch, and stack vertically with fixed spacing."
-                          
-                          // VexFlow Annotations are dumb; they stack automatically if added.
-                          // But we need custom control? VexFlow Annotation supports vertical justification.
+                          // Deduplicate labels per chord (by midi pitch)
+                          const uniqueNotes = new Map<number, NoteEvent>();
+                          group.forEach(n => uniqueNotes.set(n.midi_pitch, n));
+                          const sortedDesc = Array.from(uniqueNotes.values()).sort((a,b) => b.midi_pitch - a.midi_pitch);
 
-                          // Let's iterate Descending (High -> Low) to add annotations?
-                          // Actually, VexFlow adds them in order.
-
-                          const sortedDesc = [...group].sort((a,b) => b.midi_pitch - a.midi_pitch);
+                          // To avoid collisions, we might need X offsets, but Annotation doesn't support fine X control easily without custom rendering.
+                          // However, we can use different vertical justifications or text padding.
 
                           sortedDesc.forEach((n, labelIdx) => {
                                const labelText = n.pitch_label || "";
-
-                               // Calculate Index in the StaveNote (which is sorted Ascending)
-                               // to attach the modifier to the correct notehead?
-                               // Actually Annotation attaches to the whole stem/column usually, unless specified?
-                               // Annotation usually sits on top/bottom of the whole chord.
-
-                               // To achieve "Stack Vertically", we can add multiple Annotations.
-                               // VexFlow stacks them away from the stave.
-
-                               const annotation = new VF.Annotation(labelText)
+                               const annotation = new Annotation(labelText)
                                   .setFont("Inter", 9, "bold")
                                   .setVerticalJustification(
-                                      clef === 'treble'
-                                      ? VF.Annotation.VerticalJustify.BOTTOM // Above stave
-                                      : VF.Annotation.VerticalJustify.TOP    // Below stave
+                                      voiceId === 2
+                                      ? Annotation.VerticalJustify.BOTTOM
+                                      : Annotation.VerticalJustify.TOP
                                   );
 
-                               staveNote.addModifier(annotation, 0); // Attach to first note index
+                               // Simple logic: Attach to the notehead index corresponding to this pitch?
+                               // StaveNote keys are sorted Ascending.
+                               // Find index of this note in the sorted keys
+                               const keyIndex = sortedGroup.findIndex(g => g.midi_pitch === n.midi_pitch);
+                               if (keyIndex !== -1) {
+                                  // This puts it near the notehead usually
+                                  // For stacked labels, VexFlow stacks them automatically if multiple annotations are added.
+                                  staveNote.addModifier(annotation, keyIndex);
+                               }
                           });
                       }
+                  } else {
+                      // Rest Padding/Collision Avoidance check (basic)
+                      // VexFlow StaveNote for rest centers itself usually.
                   }
 
                   vfNotes.push(staveNote);
@@ -245,199 +243,153 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
               return vfNotes;
           };
 
-          // Process each voice separately
-          // Treble Voice 1
-          const t1 = measure.notes.filter(n => n.staff === 'treble' && n.voice === 1);
-          const vnT1 = createVexNotes(t1, "treble", t1);
+          // Separate voices per stave
+          const t1Notes = measure.notes.filter(n => n.staff === 'treble' && n.voice === 1);
+          const t2Notes = measure.notes.filter(n => n.staff === 'treble' && n.voice === 2);
+          const b1Notes = measure.notes.filter(n => n.staff === 'bass' && n.voice === 1);
+          const b2Notes = measure.notes.filter(n => n.staff === 'bass' && n.voice === 2);
 
-          // Treble Voice 2
-          const t2 = measure.notes.filter(n => n.staff === 'treble' && n.voice === 2);
-          const vnT2 = createVexNotes(t2, "treble", t2);
+          const voices: Voice[] = [];
+          const staveMap: Stave[] = []; // Track which stave each voice belongs to
 
-          // Bass Voice 1
-          const b1 = measure.notes.filter(n => n.staff === 'bass' && n.voice === 1);
-          const vnB1 = createVexNotes(b1, "bass", b1);
-
-          // Bass Voice 2
-          const b2 = measure.notes.filter(n => n.staff === 'bass' && n.voice === 2);
-          const vnB2 = createVexNotes(b2, "bass", b2);
-
-          // Helper to create VF Voice
-          const makeVoice = (notes: any[]) => {
-              const v = new VF.Voice({ num_beats: 4, beat_value: 4 }).setMode(VF.Voice.Mode.SOFT);
-              v.addTickables(notes);
-              return v;
+          const addVoice = (notes: NoteEvent[], clef: string, stave: Stave) => {
+              if (notes.length === 0) return;
+              const vfNotes = createVexNotes(notes, clef);
+              const voice = new Voice({ num_beats: 4, beat_value: 4 }).setMode(Voice.Mode.SOFT);
+              voice.addTickables(vfNotes);
+              voices.push(voice);
+              staveMap.push(stave);
           };
 
-          const voices = [];
-          if (vnT1.length > 0) voices.push(makeVoice(vnT1));
-          if (vnT2.length > 0) voices.push(makeVoice(vnT2));
-          if (vnB1.length > 0) voices.push(makeVoice(vnB1));
-          if (vnB2.length > 0) voices.push(makeVoice(vnB2));
-
-          // BEAMING & TIES logic (Post-Voice Creation)
-          // We need to generate beams based on the Tickables inside the Voice
-          // But our data "beamId" is on the source NoteEvents.
-
-          const beams: any[] = [];
-          const curves: any[] = []; // Slurs & Ties
-
-          voices.forEach(voice => {
-               const tickables = voice.getTickables();
-
-               // BEAMS
-               // Group tickables by beamId
-               let currentBeam: any[] = [];
-               let currentBeamId: string | null = null;
-
-               tickables.forEach((t: any) => {
-                   if (!t.sourceData) return;
-                   // Assuming chord notes all have same beamId (they should)
-                   const note = t.sourceData[0] as NoteEvent;
-                   if (note.isRest) {
-                       if (currentBeam.length > 0) {
-                           beams.push(new VF.Beam(currentBeam));
-                           currentBeam = [];
-                           currentBeamId = null;
-                       }
-                       return;
-                   }
-
-                   if (note.beamId) {
-                       if (note.beamId === currentBeamId) {
-                           currentBeam.push(t);
-                       } else {
-                           if (currentBeam.length > 0) beams.push(new VF.Beam(currentBeam));
-                           currentBeam = [t];
-                           currentBeamId = note.beamId;
-                       }
-                   } else {
-                        if (currentBeam.length > 0) {
-                           beams.push(new VF.Beam(currentBeam));
-                           currentBeam = [];
-                           currentBeamId = null;
-                       }
-                   }
-               });
-               if (currentBeam.length > 0) beams.push(new VF.Beam(currentBeam));
-
-               // TIES & SLURS
-               // Iterate to find connections
-               // This is tricky because Ties connect Note-to-Note across measures or within.
-               // Within measure is easy (tickable to tickable).
-               // Across measure needs context - skipped for this strict implementation scope unless critical.
-               // Plan said "Multi-bar tie generation" logic in processing. Rendering requires VexFlow StaveTie.
-               // StaveTie takes { first_note, last_note }.
-
-               // Intra-measure ties/slurs
-               const tickablesList = tickables as any[];
-               for (let j = 0; j < tickablesList.length; j++) {
-                   const t = tickablesList[j];
-                   if (!t.sourceData) continue;
-                   const n = t.sourceData[0] as NoteEvent;
-
-                   // Tie 'start' -> Look for next note with same pitch?
-                   // Simplified: render ties for split notes
-                   if (n.tie === 'start' || n.tie === 'continue') {
-                       // Find next note in this voice?
-                       // Usually next note index j+1.
-                       if (j < tickablesList.length - 1) {
-                           const nextT = tickablesList[j+1];
-                           // Verify match?
-                           // Just draw it
-                           curves.push(new VF.StaveTie({
-                               first_note: t,
-                               last_note: nextT,
-                               first_indices: [0], // simplify: tie first note of chord
-                               last_indices: [0]
-                           }));
-                       } else {
-                           // Tie to end of measure (open tie)
-                           // VexFlow hack: tie to nothing? Or StaveConnector?
-                           // StaveTie can take null last_note?
-                           // Actually, for across-bar ties, VexFlow needs the note reference from next stave.
-                           // Complex. We will omit visual cross-bar ties for this iteration to respect time constraints,
-                           // unless we store the previous measure's last note.
-                       }
-                   }
-
-                   // Slurs
-                   if (n.slurId) {
-                       // Look ahead
-                       // Collect all notes with same slurId
-                       const slurGroup = [t];
-                       let k = j + 1;
-                       while (k < tickablesList.length) {
-                           const nextT = tickablesList[k];
-                           if (nextT.sourceData && nextT.sourceData[0].slurId === n.slurId) {
-                               slurGroup.push(nextT);
-                               k++;
-                           } else {
-                               break;
-                           }
-                       }
-                       if (slurGroup.length > 1) {
-                           // Avoid duplicates: only draw if we are at start
-                           // If prev note had same slurId, skip
-                           const prevT = j > 0 ? tickablesList[j-1] : null;
-                           const isContinuation = prevT && prevT.sourceData && prevT.sourceData[0].slurId === n.slurId;
-
-                           if (!isContinuation) {
-                               curves.push(new VF.Curve(
-                                   slurGroup[0],
-                                   slurGroup[slurGroup.length-1],
-                                   { cps: [{ x: 0, y: 10 }, { x: 0, y: 10 }] } // simple curve
-                               ));
-                           }
-                       }
-                   }
-               }
-          });
+          addVoice(t1Notes, "treble", staveTreble);
+          addVoice(t2Notes, "treble", staveTreble);
+          addVoice(b1Notes, "bass", staveBass);
+          addVoice(b2Notes, "bass", staveBass);
 
           // FORMATTER
-          // Important: Join voices before formatting
-          const formatter = new VF.Formatter();
-          voices.forEach(v => formatter.joinVoices([v]));
+          // Use formatToStave for best alignment
+          const formatter = new Formatter();
+          formatter.joinVoices(voices);
 
-          formatter.format(voices, MEASURE_WIDTH - 60); // 60px padding
+          // Format based on the first stave width (assuming aligned)
+          formatter.formatToStave(voices, staveTreble);
 
           // DRAW
           voices.forEach((v, idx) => {
-              // Map voice to stave
-              // voices 0,1 -> Treble? voices 2,3 -> Bass?
-              // Need to know which stave.
-              // We pushed T1, T2, B1, B2 order.
-              // Recover via logic or direct mapping.
-
-              // Simplest:
-              // T1, T2 -> staveTreble
-              // B1, B2 -> staveBass
-
-              // We need to count exactly how many treble voices we had
-              const numTreble = (vnT1.length > 0 ? 1 : 0) + (vnT2.length > 0 ? 1 : 0);
-
-              if (idx < numTreble) {
-                  v.draw(context, staveTreble);
-              } else {
-                  v.draw(context, staveBass);
-              }
+              const stave = staveMap[idx];
+              v.setStave(stave);
+              v.draw(context, stave);
           });
 
-          beams.forEach(b => b.setContext(context).draw());
-          curves.forEach(c => c.setContext(context).draw());
+          // BEAMS (Auto-Generate)
+          voices.forEach(voice => {
+              const tickables = voice.getTickables();
+              // Generate beams automatically
+              // @ts-ignore
+              const beams = Beam.generateBeams(tickables, {
+                  beam_rests: false,
+                  beam_middle_only: true,
+                  maintain_stem_directions: true,
+                  groups: [new Fraction(2, 8)] // Beam in quarter note groups (2/8)? Or 1/2?
+                  // Default is usually per beat. 1/4 note beats.
+                  // VexFlow default might be fine.
+              });
+
+              beams.forEach(b => {
+                  b.setContext(context).draw();
+              });
+          });
+
+          // TIES & SLURS
+          // We iterate voices to find connections
+          voices.forEach(voice => {
+              const tickables = voice.getTickables() as StaveNote[];
+              tickables.forEach((t, j) => {
+                  // @ts-ignore
+                  const sourceData = t.sourceData as NoteEvent[];
+                  if (!sourceData) return;
+                  const n = sourceData[0]; // Logic for first note of chord
+
+                  // Ties
+                  if (n.tie === 'start' || n.tie === 'continue') {
+                      if (j < tickables.length - 1) {
+                          const nextT = tickables[j+1];
+                          new StaveTie({
+                              first_note: t,
+                              last_note: nextT,
+                              first_indices: [0],
+                              last_indices: [0]
+                          }).setContext(context).draw();
+                      }
+                  }
+
+                  // Slurs (using slurId)
+                  if (n.slurId) {
+                      // Check if start of slur group
+                      // Is previous note in same slur group?
+                      const prevT = j > 0 ? tickables[j-1] : null;
+                      // @ts-ignore
+                      const prevN = prevT ? prevT.sourceData?.[0] : null;
+
+                      if (!prevN || prevN.slurId !== n.slurId) {
+                          // This is start. Find end.
+                          let k = j;
+                          let lastInGroup = t;
+                          while (k < tickables.length) {
+                              const curr = tickables[k];
+                              // @ts-ignore
+                              const currN = curr.sourceData?.[0];
+                              if (currN && currN.slurId === n.slurId) {
+                                  lastInGroup = curr;
+                                  k++;
+                              } else {
+                                  break;
+                              }
+                          }
+
+                          if (lastInGroup !== t) {
+                               new Curve(t, lastInGroup, {
+                                   cps: [{ x: 0, y: 10 }, { x: 0, y: 10 }]
+                               }).setContext(context).draw();
+                          }
+                      }
+                  }
+              });
+          });
           
-          currentX += MEASURE_WIDTH;
+          currentX += dynamicWidth;
       });
       
   }, [measures, bpm, labelSettings, selectedNoteId]);
 
-  // Calculate Cursor Position directly for smooth updates
+  // Calculate Cursor Position directly for smooth updates (approximate due to dynamic widths)
+  // Since widths are dynamic, exact cursor is hard without tracking accumulated width.
+  // We will approximate or compute exact if critical.
+  // For now, use average measure width or re-calculate.
   const cursorLeft = useMemo(() => {
+      // Re-calculate accumulated width
       const beatsPerSecond = bpm / 60;
       const currentBeat = currentTime * beatsPerSecond;
-      const pixelsPerBeat = MEASURE_WIDTH / 4; 
-      return 30 + (currentBeat * pixelsPerBeat);
-  }, [currentTime, bpm]);
+
+      let x = 30; // initial padding
+      let remainingBeats = currentBeat;
+
+      for (const m of measures) {
+          const mDuration = 4; // 4/4
+          const noteCount = m.notes.length;
+          const mWidth = Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+
+          if (remainingBeats <= mDuration) {
+              x += (remainingBeats / mDuration) * mWidth;
+              remainingBeats = 0;
+              break;
+          } else {
+              x += mWidth;
+              remainingBeats -= mDuration;
+          }
+      }
+      return x;
+  }, [currentTime, bpm, measures]);
 
   return (
     <div 
@@ -445,30 +397,9 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
         onScroll={onScroll}
         className="w-full h-[400px] overflow-x-auto bg-white rounded-t-2xl shadow-sm relative select-none flex"
     >
-        {/* Wrapper to hold relative content */}
         <div className="relative min-h-full min-w-max">
-            {/* VexFlow Container */}
             <div ref={containerRef} className="h-full bg-white" />
             
-            {/* Time Axis Overlay */}
-            {measures.length > 0 && (
-                <div className="absolute bottom-0 left-0 w-full h-8 border-t border-zinc-100 pointer-events-none">
-                    {measures.map((m, i) => {
-                        const secondsPerMeasure = (4 * 60) / bpm;
-                        const time = i * secondsPerMeasure;
-                        const left = 10 + (i * MEASURE_WIDTH);
-                        return (
-                            <div key={i} className="absolute top-0 flex flex-col items-start h-full" style={{ left: `${left}px` }}>
-                                <div className="h-1.5 w-px bg-zinc-300"></div>
-                                <span className="text-[9px] text-zinc-400 font-mono mt-0.5 -ml-2 select-none">
-                                    {Math.floor(time / 60)}:{(time % 60).toFixed(0).padStart(2, '0')}
-                                </span>
-                            </div>
-                        );
-                    })}
-                </div>
-            )}
-
             {/* Playhead Cursor */}
             <div 
                 className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-10 pointer-events-none transition-all duration-75 ease-linear"
