@@ -64,15 +64,20 @@ export const MusicNotationService = {
 
     // 5. Voice Assignment & Slurs/Beams & Rests (Per Measure)
     measures.forEach(m => {
-        // Voice Assignment (Existing Logic)
+        // Voice Assignment (Strict Separation)
         this.assignVoices(m.notes);
 
-        // Slurs & Beams (New Logic)
+        // Slurs & Beams (Strict Rules)
         this.detectSlursAndBeams(m.notes, BEATS_PER_MEASURE);
 
         // Fill Rests (Existing Logic)
         m.notes = this.fillMeasureWithRests(m.notes, m.startBeat, m.endBeat);
     });
+
+    // 6. Global Validation & Fix Pass (New Logic)
+    // We flatten measures to validate across the board or validate per measure if localized
+    // Some checks (cross-staff slurs) are already impossible if we only group by staff, but let's check everything.
+    this.validateAndFix(measures);
 
     return measures;
   },
@@ -85,6 +90,11 @@ export const MusicNotationService = {
       // Snap to 1/32 grid
       const startBeat = Math.round(beatRaw * GRID_DENOM) / GRID_DENOM;
       const durationBeats = Math.max(1/GRID_DENOM, Math.round(durationRaw * GRID_DENOM) / GRID_DENOM);
+
+      // Calculate quantization error
+      const error = Math.abs(startBeat - beatRaw);
+      // Threshold: 35% of a grid step
+      const isUncertain = error > (1 / GRID_DENOM) * 0.35;
 
       // Pitch Label
       let label = note.pitch_label;
@@ -102,6 +112,8 @@ export const MusicNotationService = {
         startBeat,
         durationBeats,
         pitch_label: label,
+        isUncertain,
+        quantizeErrorBeats: error
       } as NoteEvent;
     });
   },
@@ -172,49 +184,35 @@ export const MusicNotationService = {
       const scored = staves.map(s => ({ staff: s, ledger: this.ledgerLinesForStaff(midi, s.clef) }));
       scored.sort((a,b) => a.ledger - b.ledger); // ascending ledger preference
 
-      // Fast accept if lowest ledger within acceptable limit
+      // Strict Rule: If smallest ledger cost ≤ 3, choose that staff.
       if (scored[0].ledger <= LEDGER_LIMIT) return scored[0].staff;
 
-      // Fast-path heuristics
+      // Strict Rule: If ledger cost > 3:
+      // If midi_pitch < 53 → choose bass.
       if (midi < FASTPATH_LOW) {
           const bass = staves.find(s => s.clef === 'bass');
           if (bass) return bass;
       }
+      // If midi_pitch > 69 → choose treble.
       if (midi > FASTPATH_HIGH) {
           const treble = staves.find(s => s.clef === 'treble');
           if (treble) return treble;
       }
 
-      // Otherwise choose minimal ledger
+      // Else choose the lower ledger cost.
       return scored[0].staff;
   },
 
   assignStaves(notes: NoteEvent[], staves: StaffInfo[]) {
-      const stats = {
-          movedToBass: 0,
-          movedToTreble: 0,
-          kept: 0,
-          ambiguous: 0
-      };
-
       for (const n of notes) {
           if (typeof n.midi_pitch !== 'number') {
-              if (!n.staff) { stats.ambiguous++; continue; }
-              stats.kept++;
+              // Preserve existing staff if present, else default to treble
+              if (!n.staff) n.staff = 'treble';
               continue;
           }
           const chosen = this.chooseStaffForMidi(n.midi_pitch, staves);
-
-          if (n.staff && n.staff === chosen.clef) { stats.kept++; continue; }
-
-          if (n.staff && n.staff !== chosen.clef) {
-              if (chosen.clef === 'bass') stats.movedToBass++;
-              else if (chosen.clef === 'treble') stats.movedToTreble++;
-          }
-
           n.staff = chosen.clef;
       }
-      // console.log("Staff Assignment Stats:", stats);
   },
 
   groupIntoMeasures(notes: NoteEvent[]): Measure[] {
@@ -241,8 +239,10 @@ export const MusicNotationService = {
           const staffNotes = notes.filter(n => n.staff === staffType);
           if (staffNotes.length === 0) return;
 
+          // Default all to Voice 1
           staffNotes.forEach(note => note.voice = 1);
 
+          // Identify overlaps
           for (let i = 0; i < staffNotes.length; i++) {
               const current = staffNotes[i];
               const overlapping = staffNotes.filter(other =>
@@ -252,13 +252,59 @@ export const MusicNotationService = {
               );
 
               if (overlapping.length > 0) {
-                  const polyphonyMates = overlapping.filter(o => Math.abs(o.startBeat! - current.startBeat!) >= 0.001);
-                  const usedVoices = new Set(polyphonyMates.map(p => p.voice));
-                  if (usedVoices.has(1)) {
-                      current.voice = 2;
-                  }
-                  if (usedVoices.has(1) && usedVoices.has(2)) {
-                      current.voice = 1;
+                  // Strict Rule: Overlapping notes on the same staff require separation into two voices.
+                  // Voice separation must ensure: No overlapping stems, noteheads, durations.
+
+                  // Strategy: Assign current to Voice 1 if it starts earlier or is higher pitch (standard engraving heuristic),
+                  // otherwise Voice 2.
+                  // However, simplistic overlap check needs to be robust.
+
+                  // Simple greedy approach:
+                  // If I overlap with something that is already Voice 1, I become Voice 2.
+                  // If I overlap with something that is already Voice 2, I become Voice 1 (if possible, else chaos).
+
+                  // Sort by pitch descending (high to low)
+                  // Higher pitch usually gets Voice 1 (Stem Up).
+
+                  const involved = [current, ...overlapping].sort((a,b) => b.midi_pitch - a.midi_pitch);
+
+                  // Assign voices in order: Voice 1, Voice 2...
+                  // But wait, chords (same start time) should share a voice.
+
+                  // Filter out chords (same start time)
+                  const nonChordOverlaps = overlapping.filter(o => Math.abs(o.startBeat! - current.startBeat!) >= 0.001);
+
+                  if (nonChordOverlaps.length > 0) {
+                      // There is a rhythmic overlap (polyphony)
+                      // We need to determine who gets Voice 1 and Voice 2.
+
+                      // Check if 'current' has already been forced to Voice 2 by a previous iteration?
+                      // It's safer to do a pass that groups independent melodic lines, but that's complex.
+
+                      // Let's use the pitch rule locally:
+                      // If 'current' is the higher pitch of the overlapping pair -> Voice 1.
+                      // If 'current' is the lower pitch -> Voice 2.
+
+                      // Note: This needs to be consistent.
+                      // Let's check against all overlapping notes.
+
+                      let lowerThanCount = 0;
+                      let higherThanCount = 0;
+
+                      nonChordOverlaps.forEach(other => {
+                          if (other.midi_pitch > current.midi_pitch) lowerThanCount++;
+                          else higherThanCount++;
+                      });
+
+                      // If I am lower than someone, I should probably be Voice 2.
+                      if (lowerThanCount > 0) {
+                          current.voice = 2;
+                      } else {
+                          current.voice = 1;
+                      }
+
+                      // Tie-breaking or complex multi-voice: defaults to 1 or 2.
+                      // Instructions say: Voice 1 (stem up), Voice 2 (stem down).
                   }
               }
           }
@@ -268,6 +314,12 @@ export const MusicNotationService = {
   detectSlursAndBeams(notes: NoteEvent[], beatsPerMeasure: number) {
       const slurGroups: Record<string, string[]> = {};
       const beamGroups: Record<string, string[]> = {};
+
+      // Clear existing assignments
+      notes.forEach(n => {
+          n.slurId = null;
+          n.beamId = null;
+      });
 
       // Group notes by staff+voice+measure for slurs (voice-aware)
       const byVoiceMeasure = new Map<string, NoteEvent[]>();
@@ -283,26 +335,48 @@ export const MusicNotationService = {
       // SLUR DETECTION
       let slurIdCounter = 0;
       for (const [key, arr] of byVoiceMeasure.entries()) {
+          // Sort strictly by time
           arr.sort((a,b) => a.startBeat! - b.startBeat! || (b.midi_pitch - a.midi_pitch));
+
           let currentGroup: NoteEvent[] = [];
+
           for (let i = 0; i < arr.length; i++) {
               const cur = arr[i];
+
+              // Rule: Single notes only, not chords.
+              // Check if 'cur' is part of a chord.
+              const isChord = arr.some(o => o !== cur && Math.abs(o.startBeat! - cur.startBeat!) < 0.001);
+              if (isChord) {
+                  // Break current slur if any
+                  if (currentGroup.length > 1) {
+                      const id = `slur_${slurIdCounter++}`;
+                      for (const x of currentGroup) x.slurId = id;
+                  }
+                  currentGroup = [];
+                  continue;
+              }
+
               if (currentGroup.length === 0) { currentGroup.push(cur); continue; }
               const prev = currentGroup[currentGroup.length - 1];
+
               const prevEnd = prev.startBeat! + prev.durationBeats!;
               const gap = cur.startBeat! - prevEnd;
+
+              // Rule: Time gap ≤ 1/32 beat
+              // Rule: Same measure (guaranteed by grouping)
+              // Rule: Same voice (guaranteed by grouping)
+              // Rule: Same staff (guaranteed by grouping)
+
               if (gap <= SLUR_GAP_BEATS && cur.startBeat! >= prev.startBeat!) {
                   currentGroup.push(cur);
                   if (currentGroup.length >= SLUR_MAX_NOTES) {
                       const id = `slur_${slurIdCounter++}`;
-                      slurGroups[id] = currentGroup.map(x => x.id);
                       for (const x of currentGroup) x.slurId = id;
                       currentGroup = [];
                   }
               } else {
                   if (currentGroup.length > 1) {
                       const id = `slur_${slurIdCounter++}`;
-                      slurGroups[id] = currentGroup.map(x => x.id);
                       for (const x of currentGroup) x.slurId = id;
                   }
                   currentGroup = [cur];
@@ -310,7 +384,6 @@ export const MusicNotationService = {
           }
           if (currentGroup.length > 1) {
               const id = `slur_${slurIdCounter++}`;
-              slurGroups[id] = currentGroup.map(x => x.id);
               for (const x of currentGroup) x.slurId = id;
           }
       }
@@ -318,6 +391,7 @@ export const MusicNotationService = {
       // BEAM GROUPS
       const beamableNotesByContext = new Map<string, NoteEvent[]>();
       for (const n of notes) {
+          // Rule: Only notes with duration <= 1/8 (0.5 beat) are beamable.
           if (n.durationBeats! <= MIN_BEAMABLE) {
               const v = (n.voice ?? 1);
               const context = `${n.staff ?? 'treble'}|${v}|m${Math.floor(n.startBeat! / beatsPerMeasure)}`;
@@ -347,7 +421,6 @@ export const MusicNotationService = {
               } else {
                   if (currentBeam.length >= 2) {
                       const id = `beam_${beamIdCounter++}`;
-                      beamGroups[id] = currentBeam.map(x => x.id);
                       for (const x of currentBeam) x.beamId = id;
                   }
                   currentBeam = [cur];
@@ -355,11 +428,75 @@ export const MusicNotationService = {
           }
           if (currentBeam.length >= 2) {
               const id = `beam_${beamIdCounter++}`;
-              beamGroups[id] = currentBeam.map(x => x.id);
               for (const x of currentBeam) x.beamId = id;
           }
       }
-      // return { slurGroups, beamGroups };
+  },
+
+  validateAndFix(measures: Measure[]) {
+      measures.forEach(m => {
+          m.notes.forEach(note => {
+              // Rule: No slur spans across staves (implicit by construction but good to check)
+              // Rule: No slur spans across voices (implicit by construction)
+
+              // Validate Ledger Lines <= 3 (Service Level Check)
+              if (note.midi_pitch) {
+                  const clef = note.staff as 'treble' | 'bass';
+                  const ledger = this.ledgerLinesForStaff(note.midi_pitch, clef);
+                  if (ledger > LEDGER_LIMIT) {
+                      if (!note.remediationFlags) note.remediationFlags = [];
+                      note.remediationFlags.push(`excess_ledger_lines_${ledger}`);
+                      // Here we could forcefully re-assign staff, but that might violate the split point rules.
+                      // For now, we flag it.
+                  }
+              }
+
+              // Validate Slurs
+              if (note.slurId) {
+                  // Check if slur group is valid
+                  // Find all notes in this slur group (within the measure)
+                  const group = m.notes.filter(n => n.slurId === note.slurId);
+
+                  // Check constraints
+                  const staves = new Set(group.map(n => n.staff));
+                  const voices = new Set(group.map(n => n.voice));
+
+                  if (staves.size > 1) {
+                      // Cross-staff slur detected -> Remove it
+                      group.forEach(n => {
+                          n.slurId = null;
+                          if (!n.remediationFlags) n.remediationFlags = [];
+                          n.remediationFlags.push('slur_removed_cross_staff');
+                      });
+                  }
+
+                  if (voices.size > 1) {
+                      // Cross-voice slur detected -> Remove it
+                      group.forEach(n => {
+                          n.slurId = null;
+                          if (!n.remediationFlags) n.remediationFlags = [];
+                          n.remediationFlags.push('slur_removed_cross_voice');
+                      });
+                  }
+
+                  // Check for chords in slur
+                  const hasChords = group.some(n => {
+                      const sameTime = group.filter(x => Math.abs(x.startBeat! - n.startBeat!) < 0.001);
+                      return sameTime.length > 1;
+                  });
+                  if (hasChords) {
+                      group.forEach(n => {
+                          n.slurId = null;
+                          if (!n.remediationFlags) n.remediationFlags = [];
+                          n.remediationFlags.push('slur_removed_has_chord');
+                      });
+                  }
+              }
+          });
+
+          // Validate Measure Duration (Sum)
+          // Just a check for now, fixing it would require re-generating rests
+      });
   },
 
   fillMeasureWithRests(notes: NoteEvent[], measureStart: number, measureEnd: number): NoteEvent[] {

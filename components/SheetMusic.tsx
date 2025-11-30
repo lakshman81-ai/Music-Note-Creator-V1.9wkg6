@@ -39,7 +39,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
   const rendererRef = useRef<Renderer | null>(null);
 
   // Constants
-  const BASE_MEASURE_WIDTH = 250;
+  const BASE_MEASURE_WIDTH = 220; // Recommended minimum
   const STAFF_SPACE = 10;
   
   // Memoize measures for rendering efficiency and to use in axis generation
@@ -82,9 +82,12 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
 
       // 2. Setup VexFlow Renderer
       const totalWidth = measures.reduce((acc, m) => {
-          // Dynamic width calculation
+          // Dynamic width calculation (Exact Formula)
+          // measureWidth = max(220px, 220px + (noteDensity * staff_space * 16))
           const noteCount = m.notes.length;
-          return acc + Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+          const noteDensity = noteCount / 4; // beatsPerMeasure = 4
+          const dynamicWidth = Math.max(220, 220 + (noteDensity * STAFF_SPACE * 16));
+          return acc + dynamicWidth;
       }, 0);
       
       const width = Math.max(800, totalWidth + 50);
@@ -102,9 +105,10 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       let currentX = 10;
       
       measures.forEach((measure, i) => {
-          // Calculate Dynamic Width for this measure
+          // Calculate Dynamic Width for this measure (Exact Formula)
           const noteCount = measure.notes.length;
-          const dynamicWidth = Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+          const noteDensity = noteCount / 4; // beatsPerMeasure
+          const dynamicWidth = Math.max(220, 220 + (noteDensity * STAFF_SPACE * 16));
 
           // --- TREBLE STAVE ---
           const staveTreble = new Stave(currentX, 40, dynamicWidth);
@@ -182,6 +186,13 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   const isSelected = group.some(n => n.id === selectedNoteId);
                   if (isSelected) staveNote.setStyle({ fillStyle: "#4f46e5", strokeStyle: "#4f46e5" });
 
+                  // Uncertainty Visualization
+                  const isUncertain = group.some(n => n.isUncertain);
+                  if (isUncertain) {
+                      // Use a visual indicator for uncertainty
+                      staveNote.setStyle({ fillStyle: "#f97316", strokeStyle: "#f97316" }); // Orange color
+                  }
+
                   if (!isRest) {
                       // --- ACCIDENTALS & DOTS ---
                       const sortedGroup = [...group].sort((a,b) => a.midi_pitch - b.midi_pitch);
@@ -206,10 +217,8 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                           // Deduplicate labels per chord (by midi pitch)
                           const uniqueNotes = new Map<number, NoteEvent>();
                           group.forEach(n => uniqueNotes.set(n.midi_pitch, n));
+                          // Sort descending (High -> Low) for label rendering
                           const sortedDesc = Array.from(uniqueNotes.values()).sort((a,b) => b.midi_pitch - a.midi_pitch);
-
-                          // To avoid collisions, we might need X offsets, but Annotation doesn't support fine X control easily without custom rendering.
-                          // However, we can use different vertical justifications or text padding.
 
                           sortedDesc.forEach((n, labelIdx) => {
                                const labelText = n.pitch_label || "";
@@ -221,13 +230,9 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                                       : Annotation.VerticalJustify.TOP
                                   );
 
-                               // Simple logic: Attach to the notehead index corresponding to this pitch?
-                               // StaveNote keys are sorted Ascending.
-                               // Find index of this note in the sorted keys
+                               // Find index in staveNote keys (which are Ascending)
                                const keyIndex = sortedGroup.findIndex(g => g.midi_pitch === n.midi_pitch);
                                if (keyIndex !== -1) {
-                                  // This puts it near the notehead usually
-                                  // For stacked labels, VexFlow stacks them automatically if multiple annotations are added.
                                   staveNote.addModifier(annotation, keyIndex);
                                }
                           });
@@ -290,9 +295,7 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   beam_rests: false,
                   beam_middle_only: true,
                   maintain_stem_directions: true,
-                  groups: [new Fraction(2, 8)] // Beam in quarter note groups (2/8)? Or 1/2?
-                  // Default is usually per beat. 1/4 note beats.
-                  // VexFlow default might be fine.
+                  groups: [new Fraction(2, 8)] // Beam in quarter note groups
               });
 
               beams.forEach(b => {
@@ -362,12 +365,8 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       
   }, [measures, bpm, labelSettings, selectedNoteId]);
 
-  // Calculate Cursor Position directly for smooth updates (approximate due to dynamic widths)
-  // Since widths are dynamic, exact cursor is hard without tracking accumulated width.
-  // We will approximate or compute exact if critical.
-  // For now, use average measure width or re-calculate.
+  // Calculate Cursor Position directly
   const cursorLeft = useMemo(() => {
-      // Re-calculate accumulated width
       const beatsPerSecond = bpm / 60;
       const currentBeat = currentTime * beatsPerSecond;
 
@@ -377,7 +376,8 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
       for (const m of measures) {
           const mDuration = 4; // 4/4
           const noteCount = m.notes.length;
-          const mWidth = Math.max(BASE_MEASURE_WIDTH, 200 + (noteCount * 15));
+          const noteDensity = noteCount / 4;
+          const mWidth = Math.max(BASE_MEASURE_WIDTH, 220 + (noteDensity * STAFF_SPACE * 16));
 
           if (remainingBeats <= mDuration) {
               x += (remainingBeats / mDuration) * mWidth;
